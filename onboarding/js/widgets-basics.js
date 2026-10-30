@@ -855,4 +855,175 @@
     body.append(h("div", { class: "row", style: { marginBottom: "10px" } }, seg([["0", "Router uses .await"], ["1", "Router makes a blocking call"]], "0", (v) => { blocking = v === "1"; draw(); })), out, stats);
     draw();
   };
+
+  /* ===================== Worker spin-up: where GPU memory goes ===================== */
+  W.workerboot = function (el) {
+    const { slider, seg, stat } = GS;
+    const body = frame(el, "Spin up a worker", "Pick a model, a GPU and how many GPUs the worker spans, then press <b>Start worker</b>. Whatever is left after weights and overhead becomes the KV block pool. Numbers are illustrative round figures, not benchmarks.");
+    const MODELS = {
+      "8b": { name: "Llama-3 8B · FP16", gb: 16, kvb: 131072 },
+      "70b8": { name: "Llama-3 70B · FP8", gb: 70, kvb: 327680 },
+      "70b16": { name: "Llama-3 70B · FP16", gb: 140, kvb: 327680 },
+    };
+    const OVER = 2.5; // GB per GPU: CUDA context, activation peak, comms buffers
+    const STEPS = [
+      "Launch the process (python -m dynamo.vllm …) and start the engine",
+      "Load weights from disk into GPU memory",
+      "Profile run: measure peak activation memory",
+      "Carve the KV block pool out of whatever budget is left",
+      "Capture CUDA graphs and warm up",
+      "Register the endpoint and model card in discovery. The router can now see this worker",
+    ];
+    let model = "8b", mem = 16, tp = 1, util = 0.9, timer = null, stage = -1, failAt = -1, failMsg = "";
+    const out = h("div"), steps = h("ol", { class: "steps-list", style: { margin: "12px 0 0", paddingLeft: "20px" } });
+
+    function calc() {
+      const m = MODELS[model], w = m.gb / tp, budget = mem * util, kv = budget - w - OVER;
+      return { m, w, budget, kv, tokens: kv > 0 ? (kv * tp * 1e9) / m.kvb : 0 };
+    }
+    function bar(c) {
+      const seg1 = (label, gb, color, extra) => gb > 0 ? `<div title="${label}: ${fmt(gb, 1)} GB" style="width:${Math.min(100, (gb / mem) * 100)}%;background:${color};${extra || ""}"></div>` : "";
+      const used = Math.min(mem, c.w) , over = Math.min(OVER, Math.max(0, mem - used));
+      const kv = Math.max(0, Math.min(c.kv, mem - used - over)), free = Math.max(0, mem - used - over - kv);
+      const cap = `<div style="position:absolute;left:${util * 100}%;top:-4px;bottom:-4px;border-left:2px dashed var(--ink)"></div>`;
+      return `<div style="position:relative;display:flex;height:34px;border:1px solid var(--rule);border-radius:6px;overflow:hidden;margin:6px 0 4px">
+        ${seg1("weights", used, c.w > c.budget ? "var(--bad, #c0392b)" : "var(--c2)")}${seg1("overhead", over, "var(--c4)")}${seg1("KV block pool", kv, "var(--c1)")}${seg1("unused", free, "transparent")}${cap}</div>
+        <div class="mono muted" style="font-size:12px;display:flex;gap:14px;flex-wrap:wrap"><span style="color:var(--c2)">■ weights ${fmt(c.w, 1)} GB</span><span style="color:var(--c4)">■ overhead ${OVER} GB</span><span style="color:var(--c1)">■ KV pool ${fmt(Math.max(0, c.kv), 1)} GB</span><span>┆ dashed = gpu_memory_utilization (${Math.round(util * 100)}%)</span></div>`;
+    }
+    function draw() {
+      const c = calc(), fits = c.kv > 0;
+      const cross = tp > 8;
+      out.innerHTML = `<div class="lbl">MEMORY ON EACH OF THE ${tp} GPU${tp > 1 ? "S" : ""} (${mem} GB each)</div>${bar(c)}
+        <div class="stat-row" style="margin-top:10px">
+          ${stat("KV pool, whole worker", fits ? fmt(c.kv * tp, 0) + " GB" : "none", fits ? "" : "bad")}
+          ${stat("Tokens of KV it can hold", fits ? fmt(c.tokens / 1000, 0) + "k" : "0", fits ? "" : "bad")}
+          ${stat("Concurrent 8k-token chats", fits ? Math.floor(c.tokens / 8192) : 0, fits ? "" : "bad")}
+          ${stat("GPUs lost if it crashes", tp)}
+        </div>
+        ${!fits ? `<p class="callout" style="margin-top:10px"><b>This worker can't start.</b> ${c.w > c.budget ? "The weights alone (" + fmt(c.w, 0) + " GB per GPU) exceed the budget." : "Weights plus overhead leave nothing for KV cache."} Raise the GPU count, lower the model size, or raise utilization.</p>` : ""}
+        ${cross ? `<p class="callout" style="margin-top:10px"><b>Spans more than one server.</b> Tensor parallelism does an all-reduce in every layer of every step. Past 8 GPUs that traffic leaves NVLink inside the box (unless the rack is one NVLink domain like NVL72). This model also has only 8 KV heads, so beyond TP=8 engines duplicate them and the pool above is optimistic.</p>` : ""}`;
+    }
+    function renderSteps() {
+      steps.innerHTML = STEPS.map((s, i) => {
+        const failed = i === failAt, done = i <= stage && failAt < 0 || (failAt >= 0 && i < failAt && i <= stage), active = i === stage + 1 && timer;
+        const mark = failed ? "✖" : done ? "✔" : active ? "…" : "○";
+        const color = failed ? "var(--bad, #c0392b)" : done ? "var(--c1)" : "var(--ink-soft)";
+        return `<li style="color:${color};margin:4px 0;list-style:none;margin-left:-20px">${mark} ${s}${failed ? `<div class="mono" style="font-size:12px">${failMsg}</div>` : ""}</li>`;
+      }).join("");
+    }
+    function start() {
+      clearInterval(timer); stage = -1; failAt = -1; failMsg = "";
+      const c = calc();
+      timer = setInterval(() => {
+        const next = stage + 1;
+        if (next === 1 && c.w > c.budget) { failAt = 1; failMsg = `CUDA out of memory while loading weights (${fmt(c.w, 0)} GB needed, ${fmt(c.budget, 0)} GB budget)`; }
+        else if (next === 3 && c.kv <= 0) { failAt = 3; failMsg = "No available memory for the cache blocks. Increase gpu_memory_utilization or decrease max model length"; }
+        if (failAt >= 0) { clearInterval(timer); timer = null; stage = failAt - 1; renderSteps(); GS.award("worker-oom", 5, "Saw a worker fail to start"); return; }
+        stage = next; if (stage >= STEPS.length - 1) { clearInterval(timer); timer = null; }
+        renderSteps();
+      }, 650);
+      renderSteps();
+    }
+    const modelSeg = seg(Object.entries(MODELS).map(([k, m]) => [k, m.name]), model, (v) => { model = v; reset(); });
+    const gpuSeg = seg([["16", "RTX 4070 Ti S · 16 GB"], ["80", "H100 · 80 GB"], ["192", "B200 · 192 GB"]], String(mem), (v) => { mem = +v; reset(); });
+    const tpSeg = seg([["1", "1 GPU"], ["2", "2"], ["4", "4"], ["8", "8 (one server)"], ["72", "72 (a whole rack)"]], String(tp), (v) => { tp = +v; reset(); });
+    const utilSl = slider("gpu_memory_utilization", 0.5, 0.98, 0.01, util, (v) => { util = v; reset(); }, (v) => v.toFixed(2));
+    function reset() { clearInterval(timer); timer = null; stage = -1; failAt = -1; draw(); renderSteps(); }
+    body.append(
+      h("div", { class: "row", style: { marginBottom: "8px" } }, h("span", { class: "lbl", text: "Model" }), modelSeg),
+      h("div", { class: "row", style: { marginBottom: "8px" } }, h("span", { class: "lbl", text: "GPU" }), gpuSeg),
+      h("div", { class: "row", style: { marginBottom: "8px" } }, h("span", { class: "lbl", text: "Spans" }), tpSeg),
+      utilSl, out,
+      h("div", { class: "row", style: { marginTop: "12px" } }, h("button", { class: "btn small primary", type: "button", text: "Start worker", onclick: start })),
+      steps);
+    draw(); renderSteps();
+    return () => timer && clearInterval(timer);
+  };
+
+  /* ===================== Worker under load: sharing one KV pool, and breaking it ===================== */
+  W.workerserve = function (el) {
+    const { slider, seg, stat, rng } = GS;
+    const body = frame(el, "Serve traffic, then break the worker", "Every request draws blocks from one shared pool. Turn the load up, send a burst of long prompts, or kill the GPU, and watch what each failure looks like.");
+    const POOL = 80, MAX_SEQ = 32, GROW_EVERY = 3, DOWN_TICKS = 10;
+    const colors = ["var(--c1)", "var(--c2)", "var(--c3)", "var(--c4)", "var(--c5)", "var(--c6)"];
+    let r = rng(11), nid = 1, timer = null, rate = 0.5, prompt = 4, mode = "preempt", failover = false;
+    let S;
+    const fresh = () => ({ run: [], wait: [], done: 0, preempt: 0, lost: 0, rescued: 0, down: 0, tick: 0, note: "" });
+    S = fresh();
+    const view = h("div"), note = h("p", { class: "muted", style: { fontSize: "14px", minHeight: "22px" } });
+    const used = () => S.run.reduce((a, q) => a + q.blocks, 0);
+    const mk = (p) => ({ id: nid++, P: p, blocks: 0, age: 0, G: 3 + Math.floor(r() * 5), t0: S.tick });
+
+    function crash(why) {
+      const n = S.run.length + S.wait.length;
+      if (failover) S.rescued += n; else S.lost += n;
+      S.run = []; S.wait = []; S.down = DOWN_TICKS;
+      S.note = `${why} The worker process is gone: ${n} request${n === 1 ? "" : "s"} ${failover ? "were retried on a peer (Dynamo's request migration)" : "failed with an error"}. Its lease expires and the router stops sending it traffic until it restarts.`;
+      GS.award("worker-break", 5, "Broke a worker on purpose");
+    }
+    function admit() {
+      while (S.wait.length && S.run.length < MAX_SEQ && S.wait[0].P + (S.wait[0].blocks || 0) <= POOL - used()) {
+        const q = S.wait.shift(); q.blocks = q.P; S.run.push(q);
+      }
+    }
+    function step() {
+      S.tick++;
+      if (S.down > 0) {
+        S.down--; if (r() < rate) (failover ? S.rescued++ : S.lost++);
+        if (S.down === 0) S.note = "Worker is back: weights loaded, pool rebuilt (empty, so every cached prefix is gone), re-registered with discovery.";
+        draw(); return;
+      }
+      if (r() < rate) S.wait.push(mk(prompt));
+      admit();
+      for (const q of [...S.run]) {
+        if (!S.run.includes(q)) continue;
+        q.age++;
+        if (q.age % GROW_EVERY === 0) {
+          while (used() >= POOL) {
+            if (mode === "oom") { crash("Out of KV blocks with nothing to evict."); draw(); return; }
+            const victim = [...S.run].reverse().find((v) => v !== q) || q;
+            S.run.splice(S.run.indexOf(victim), 1); victim.blocks = 0; victim.age = 0; S.wait.unshift(victim); S.preempt++;
+            S.note = "Pool full: the newest request was preempted. Its blocks were freed and it will redo its prefill later.";
+            if (victim === q) break;
+          }
+          if (S.run.includes(q)) q.blocks++;
+        }
+        if (S.run.includes(q) && q.blocks >= q.P + q.G) { S.run.splice(S.run.indexOf(q), 1); S.done++; }
+      }
+      admit();
+      draw();
+    }
+    function draw() {
+      const u = used(), pct = Math.round((u / POOL) * 100), itl = S.down ? "—" : Math.round(12 + 1.1 * S.run.length) + " ms";
+      const cells = [];
+      S.run.forEach((q) => { for (let i = 0; i < q.blocks; i++) cells.push(`<span title="request ${q.id}" style="background:${colors[q.id % 6]}"></span>`); });
+      while (cells.length < POOL) cells.push(`<span class="free"></span>`);
+      const oldest = S.wait.length ? S.tick - Math.min(...S.wait.map((q) => q.t0)) : 0;
+      view.innerHTML = `<style>.kvp{display:flex;flex-wrap:wrap;gap:3px;line-height:0}.kvp span{width:18px;height:18px;border-radius:3px;display:inline-block}.kvp .free{border:1px dashed var(--rule)}</style>
+        <div class="lbl" style="margin-bottom:6px">${S.down ? `WORKER DOWN · restarting (${S.down})` : `ONE SHARED KV POOL · ${POOL} blocks`}</div>
+        <div class="kvp" style="${S.down ? "opacity:.3" : ""}">${cells.join("")}</div>
+        <div class="stat-row" style="margin-top:10px">
+          ${stat("Running", S.run.length)}${stat("Waiting", S.wait.length, S.wait.length > 3 ? "bad" : "")}${stat("Pool used", pct + "%", pct > 90 ? "bad" : "")}
+          ${stat("ITL (per-token)", itl, S.run.length > 20 ? "bad" : "")}${stat("Longest wait", oldest + " ticks", oldest > 8 ? "bad" : "")}
+          ${stat("Preemptions", S.preempt)}${stat("Finished", S.done)}${stat(failover ? "Rescued" : "Failed", failover ? S.rescued : S.lost, S.lost ? "bad" : "")}</div>`;
+      note.textContent = S.note;
+    }
+    function burst() { for (let i = 0; i < 5; i++) S.wait.push(mk(16)); S.note = "Five long prompts arrived at once. Each needs 16 blocks before it can even start."; admit(); draw(); }
+    const auto = h("button", { class: "btn small", type: "button", text: "Auto-run" });
+    auto.onclick = () => { if (timer) { clearInterval(timer); timer = null; auto.textContent = "Auto-run"; } else { timer = setInterval(step, 450); auto.textContent = "Pause"; } };
+    body.append(
+      h("div", { class: "row", style: { marginBottom: "10px" } },
+        auto, h("button", { class: "btn small", type: "button", text: "Step", onclick: step }),
+        h("button", { class: "btn small", type: "button", text: "Long-prompt burst", onclick: burst }),
+        h("button", { class: "btn small", type: "button", text: "Kill the GPU (Xid error)", onclick: () => { if (!S.down) { crash("The GPU hit a fatal error."); draw(); } } }),
+        h("button", { class: "btn small ghost", type: "button", text: "Reset", onclick: () => { S = fresh(); r = rng(11); nid = 1; draw(); } })),
+      slider("Arrival rate", 0.1, 1, 0.05, rate, (v) => { rate = v; }, (v) => v.toFixed(2) + " req/tick"),
+      slider("Prompt length", 1, 16, 1, prompt, (v) => { prompt = v; }, (v) => v + " blocks"),
+      h("div", { class: "row", style: { margin: "8px 0" } }, h("span", { class: "lbl", text: "Pool full →" }),
+        seg([["preempt", "preempt and recompute"], ["oom", "crash (naive engine)"]], mode, (v) => { mode = v; }),
+        h("label", { class: "row", style: { gap: "6px" } }, h("input", { type: "checkbox", onchange: (e) => { failover = e.target.checked; draw(); } }), "A peer worker exists (migration)")),
+      view, note);
+    draw();
+    return () => timer && clearInterval(timer);
+  };
 })();

@@ -336,6 +336,58 @@ ${code("text", `GPU A (prefill) ──NVLink / RDMA via NIXL──▶ GPU B (dec
   });
 
   GS.lesson({
+    id: "worker", ch: "c3", title: "Anatomy of a worker", mins: 10, labs: 2,
+    summary: "A worker is one engine process that owns some GPUs and one pool of KV blocks. See how it starts, how requests share it, and the specific ways it breaks.",
+    goals: ["Say what a worker owns and what lives inside it", "Explain where GPU memory goes and why the KV pool is finite", "Explain why one giant worker doesn't replace many workers", "Name the main ways a worker fails and what Dynamo does about each"],
+    body: () => `
+<p>The word ${t("worker")} keeps appearing because it's the unit Dynamo routes to, scales, and replaces. A worker is a <strong>process</strong>: an ${t("engine", "inference engine")} plus Dynamo's glue, owning one or more GPUs for as long as it runs. Launching one looks like <code>python -m dynamo.vllm --model …</code>.</p>
+
+<h2>What it owns</h2>
+<ul>
+  <li><strong>GPU memory</strong>, all of it, claimed at startup. Nothing else can use those GPUs.</li>
+  <li><strong>A KV block pool</strong> carved from that memory. Every request the worker serves draws blocks from this one pool and returns them when it finishes.</li>
+  <li><strong>A scheduler loop</strong> that runs forever: each step it picks the running requests, generates one token for each in a single batch, admits waiting requests if blocks allow, and retires finished ones. This is continuous ${t("batching")}.</li>
+  <li><strong>A registration</strong> in ${t("discovery")}: its endpoint plus a model card, so the frontend and router know it exists.</li>
+</ul>
+
+<h2>Where the memory goes</h2>
+<p>At startup the engine loads the ${t("weights")}, measures how much memory a forward pass needs for activations, then hands <em>everything left under its budget</em> to the KV pool. That budget is a fraction of the GPU, <code>gpu_memory_utilization</code> in vLLM. The pool is fixed from then on. It doesn't grow when traffic does.</p>
+<div data-widget="workerboot"></div>
+<p>Try the 70B FP16 model on one H100: the weights alone are 140 GB, so the worker can't even start. Spread it over 4 GPUs and each holds 35 GB of weights, which leaves a large pool.</p>
+
+<h2>"Why not just one huge worker for the whole rack?"</h2>
+<p>Paged attention fixes <em>fragmentation</em> (wasted gaps inside the pool). It doesn't make the pool bigger. Making the pool bigger means more GPUs, and the lab above shows that really does work: spanning more GPUs shards the weights, so more memory is left for KV. Rack-scale workers exist (NVL72 racks, wide expert parallelism for MoE models). But a single giant worker has real costs:</p>
+<ul>
+  <li><strong>Communication on every step.</strong> Tensor parallelism all-reduces activations in every layer of every token step. That's fine over NVLink inside a server or an NVLink-connected rack. Across servers on InfiniBand it eats into ${t("itl")}.</li>
+  <li><strong>Diminishing returns.</strong> Adding GPUs to one worker adds memory, but each step still has the same sequential layers. You get more capacity without proportionally more speed per user.</li>
+  <li><strong>Blast radius.</strong> If any GPU in a 72-GPU worker faults, the whole worker dies and every in-flight request with it. Eight 9-GPU workers lose one-eighth.</li>
+  <li><strong>Less to route.</strong> Dynamo's wins come from choosing <em>between</em> workers: cache overlap, load, prefill vs decode roles. One worker gives the router nothing to choose.</li>
+  <li><strong>Model limits.</strong> Models with few KV heads (many have 8) stop sharding cleanly past TP=8, so extra GPUs start duplicating KV instead of adding to it.</li>
+</ul>
+<div class="callout"><b>Rule of thumb</b>
+Make a worker as big as it needs to be to fit the model with a healthy KV pool, then scale <em>out</em> with more workers. Dynamo is the part that makes scaling out behave like one service.</div>
+
+<h2>Under load, and where it breaks</h2>
+<p>One pool is shared by everyone the worker is serving. Requests that don't fit wait in a queue, and a long wait is what users feel as high ${t("ttft")}. Run the lab below and make each of these failures happen:</p>
+<div data-widget="workerserve"></div>
+<table>
+  <tr><th>Failure</th><th>What you see</th><th>What handles it</th></tr>
+  <tr><td>Pool nearly full</td><td>Queue grows, TTFT climbs, ITL rises with batch size</td><td>The ${t("router")} sees load and sends traffic elsewhere. The ${t("planner")} adds workers.</td></tr>
+  <tr><td>Pool full mid-generation</td><td>Engine preempts a request and recomputes its prefill later</td><td>The engine itself. Lots of preemption means the pool is too small.</td></tr>
+  <tr><td>No eviction path</td><td>Out of memory, process dies</td><td>Avoided by modern engines; shown in the lab as the naive case.</td></tr>
+  <tr><td>GPU fault or crash</td><td>Every in-flight request on that worker breaks and its cache is lost</td><td>The ${t("lease")} expires so routing stops. <code>Migration</code> retries the request on another worker.</td></tr>
+</table>
+<p>The last row is why a fleet matters more than a big machine: tolerating a dead worker requires another worker to exist.</p>
+<p class="margin-note">Source for the glue: ${src("components/src/dynamo/vllm/main.py")} starts the vLLM worker. Registration and leases are in ${src("lib/runtime/src/discovery/mod.rs")}.</p>
+`,
+    quiz: [
+      { q: "A worker is serving 40 users. How is its KV cache memory organized?", a: ["Each user gets a fixed private slice", "One shared pool of blocks that requests draw from as they grow", "It lives in CPU RAM", "Each user gets its own worker"], c: 1, why: "All running requests share one block pool; paged attention hands out blocks on demand and takes them back when requests finish." },
+      { q: "Why can't paged attention alone solve “not enough KV memory”?", a: ["It only works on CPUs", "It removes fragmentation but the pool is still finite", "It makes blocks bigger", "It disables batching"], c: 1, why: "Paging reduces waste inside the pool. Capacity still equals GPU memory minus weights and overhead." },
+      { q: "Why is one worker spanning a whole rack not automatically better than many workers?", a: ["GPUs can't be shared", "Per-layer communication, a big failure blast radius, and nothing left for the router to choose between", "Racks have no memory", "Engines forbid it"], c: 1, why: "More GPUs add memory but also synchronization cost, and if one fails the whole worker dies. Many workers give routing and fault tolerance." },
+    ],
+  });
+
+  GS.lesson({
     id: "prefix-cache", ch: "c3", title: "Prefix caching and block hashes", mins: 12, labs: 1,
     summary: "If two requests start with the same tokens, their KV blocks are identical. Hash each block, chain the hashes, and you can detect and reuse shared prefixes instantly.",
     goals: ["Explain prefix caching and why chat apps benefit hugely", "Explain local block hashes vs sequence hashes", "Read Dynamo's block hashing code"],
